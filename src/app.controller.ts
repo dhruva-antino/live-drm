@@ -8,6 +8,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { AppService, StreamOptions } from './app.service';
+import { StreamService } from './hls.service';
 
 console.log({
   signingKeyAsHex: process.env.WIDEVINE_SIGNING_KEY,
@@ -17,11 +18,14 @@ console.log({
 });
 @Controller('createStream')
 export class AppController {
-  constructor(private readonly appService: AppService) {}
+  constructor(
+    private readonly appService: AppService,
+    private readonly streamService: StreamService,
+  ) {}
 
   @Post('create')
   createStream(@Query('port') port: number, @Query('key') key: string): string {
-    return this.appService.createStream(port, key);
+    return this.appService.createStreamSRT(port, key);
   }
 
   // @Post('start')
@@ -70,6 +74,33 @@ export class AppController {
   //   return this.appService.startListener(streamId, body);
   // }
 
+  @Post('hls')
+  createHLSStream(@Body() body: { inputUrl: string; streamKey: string }) {
+    return this.streamService.createHLSStream(body.inputUrl, body.streamKey);
+  }
+
+  @Post('hls/:streamId/start')
+  startHLSStream(
+    @Param('streamId') streamId: string,
+    @Body()
+    body: {
+      resolutions?: Array<{ width: number; height: number; bitrate?: string }>;
+    },
+  ) {
+    return this.streamService.startHLSStream(streamId, {
+      resolutions: body.resolutions,
+    });
+  }
+
+  @Post('convert')
+  async convert(@Body() body: { hlsUrl: string; streamId: string }) {
+    const dashUrl = await this.streamService.convertAndUploadHlsToDash(
+      body.hlsUrl,
+      body.streamId
+    );
+    return { dashUrl };
+  }
+
   @Post('start')
   async startListenerSRT(
     @Query('id') streamId: string,
@@ -79,8 +110,6 @@ export class AppController {
     if (!streamId) {
       throw new BadRequestException('Missing stream ID');
     }
-
-    // Validate resolutions if present
     if (body.resolutions) {
       for (const res of body.resolutions) {
         if (
@@ -128,7 +157,7 @@ export class AppController {
       signer: process.env.WIDEVINE_PROVIDER_NAME,
       keyServerUrl: process.env.KEY_SERVER_URL,
     });
-    return this.appService.startDRMProtectedStream(streamId, {
+    return this.appService.startListenerSRTWithDRM(streamId, {
       ...body,
       isDRM: true,
       resolutions: body.resolutions,
@@ -156,8 +185,10 @@ export class AppController {
   }
 
   @Post('start-simple')
-  startSimpleStream(@Body() body: { youtubeKey: string }) {
-    return this.appService.startSimpleStream(body.youtubeKey);
+  startSimpleStream(@Body() body: { youtubeKey: string, options: StreamOptions }) {
+    // return this.appService.startSimpleStream(body.youtubeKey);
+    console.log({body})
+    return this.appService.startRtmpToHlsS3( body.options);
   }
 
   @Post('create-rtmp')
@@ -172,4 +203,6 @@ export class AppController {
   ) {
     return this.appService.startStream(streamId, body.youtubeKey);
   }
+
+  
 }

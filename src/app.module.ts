@@ -8,6 +8,7 @@ import { AppService } from './app.service';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { join } from 'path';
 import { HttpModule } from '@nestjs/axios';
+import { StreamService } from './hls.service';
 
 @Module({
   imports: [
@@ -24,7 +25,7 @@ import { HttpModule } from '@nestjs/axios';
     }),
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [AppService, StreamService],
   //  providers: [
   //   {
   //     provide: APP_GUARD,
