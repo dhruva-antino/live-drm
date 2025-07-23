@@ -267,24 +267,25 @@ export class AppService {
     let firstFileUploaded = false;
     const masterPlaylistPath = path.join(stream.outputDir, 'master.m3u8');
 
-    // const srtUrl = `srt://0.0.0.0:${stream.port}?mode=listener&streamid=#!::r=${stream.streamKey}`;
-    // const srtUrl = `srt://test.antmedia.io:4200?mode=listener&streamid=#!::r=WebRTCAppEE/streamId_FY7Y9gFxy`;
-    const srtUrl = `srt://0.0.0.0:${stream.port}?mode=listener`;
-    // const srtUrl = `srt://test.antmedia.io:4200?streamid=#!::r=WebRTCAppEE/streamId_FY7Y9gFxy`;
-    // const srtUrl = `srt://domeproductions-vngdkppdwm.dynamic-m.com:11383`;
+    // const srtUrl = `srt://563fg0wz-3333.inc1.devtunnels.ms:9000`;
+    // const srtUrl = `srt://06d7721f4128.ngrok-free.app:9000?mode=listener&whitelist=0.0.0.0/0`;
+    // const srtUrl = `srt://0.0.0.0:8000?mode=listener`;
+    const srtUrl = `srt://domeproductions-vngdkppdwm.dynamic-m.com:11383`;
 
     const outputPath = path.join(stream.outputDir, 'master.m3u8');
     console.time('Time starts for ffmpeg ------>');
     const ffmpegArgs = [
       '-hide_banner',
       '-loglevel',
-      'error',
+      'debug',
+      '-protocol_whitelist',
+      'file,crypto,udp,rtp,tcp,srt,http,https,tls',
       '-fflags',
       '+genpts',
       '-analyzeduration',
-      '10M',
+      '2M',
       '-probesize',
-      '10M',
+      '2M',
       '-i',
       srtUrl,
     ];
@@ -318,6 +319,14 @@ export class AppService {
         'veryfast',
         '-c:a',
         'aac',
+        '-force_key_frames',
+        'expr:gte(t,n_forced*2)', // Keyframe every 4 seconds
+        '-g',
+        '48', // GOP size: 12 * segment duration (4s) * FPS (assume 12 fps) or adjust accordingly
+        '-keyint_min',
+        '48',
+        '-sc_threshold',
+        '0',
       );
 
       options.resolutions.forEach((_, i) => {
@@ -325,6 +334,10 @@ export class AppService {
       });
 
       ffmpegArgs.push(
+        '-force_key_frames',
+        'expr:gte(t,n_forced*2)', // Force keyframes every 4 seconds
+        '-sc_threshold',
+        '0',
         '-f',
         'hls',
         '-hls_time',
@@ -343,6 +356,10 @@ export class AppService {
       );
     } else {
       ffmpegArgs.push(
+        '-force_key_frames',
+        'expr:gte(t,n_forced*4)', // Force keyframes every 4 seconds
+        '-sc_threshold',
+        '0',
         '-c:v',
         'copy',
         '-c:a',
@@ -354,6 +371,14 @@ export class AppService {
         '-hls_time',
         '4',
         '-hls_list_size',
+        '0',
+        '-force_key_frames',
+        'expr:gte(t,n_forced*4)', // Keyframe every 4 seconds
+        '-g',
+        '48', // GOP size: 12 * segment duration (4s) * FPS (assume 12 fps) or adjust accordingly
+        '-keyint_min',
+        '48',
+        '-sc_threshold',
         '0',
         '-hls_flags',
         'independent_segments+append_list',
@@ -371,7 +396,7 @@ export class AppService {
     console.log({ startTime });
     ffmpeg.stderr.on('data', (data) => {
       const msg = data.toString();
-      console.log({ msg });
+      // console.log({ msg });
       if (msg.includes('Input #0')) {
         stream.status = 'active';
         stream.timings.ffmpegActive = Date.now();
@@ -379,7 +404,7 @@ export class AppService {
           `[${streamId}] FFmpeg active in: ${stream.timings.ffmpegActive - stream.timings.ffmpegStart}ms`,
         );
       }
-      console.log(`[${streamId}] ffmpeg:`, msg.trim());
+      // console.log(`[${streamId}] ffmpeg:`, msg.trim());
     });
 
     ffmpeg.on('close', async (code) => {
@@ -433,16 +458,6 @@ export class AppService {
         console.error(`[S3] Upload failed for ${filePath}`, err);
       }
     };
-
-    await this.s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: `${s3Prefix}/master.m3u8`,
-        Body: fs.createReadStream(masterPlaylistPath),
-        ContentType: 'application/vnd.apple.mpegurl',
-        ACL: 'public-read',
-      }),
-    );
 
     const watcher = chokidar.watch(stream.outputDir, {
       persistent: true,

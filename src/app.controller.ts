@@ -74,6 +74,14 @@ export class AppController {
   //   return this.appService.startListener(streamId, body);
   // }
 
+  @Get('test-websocket')
+  testWebSocket() {
+    return {
+      status: 'active',
+      port: 8080,
+      path: '/signaling',
+    };
+  }
   @Post('hls')
   createHLSStream(@Body() body: { inputUrl: string; streamKey: string }) {
     return this.streamService.createHLSStream(body.inputUrl, body.streamKey);
@@ -87,7 +95,7 @@ export class AppController {
       resolutions?: Array<{ width: number; height: number; bitrate?: string }>;
     },
   ) {
-    return this.streamService.startHLSStream(streamId, {
+    return this.streamService.startHLSStreamV1(streamId, {
       resolutions: body.resolutions,
     });
   }
@@ -96,7 +104,7 @@ export class AppController {
   async convert(@Body() body: { hlsUrl: string; streamId: string }) {
     const dashUrl = await this.streamService.convertAndUploadHlsToDash(
       body.hlsUrl,
-      body.streamId
+      body.streamId,
     );
     return { dashUrl };
   }
@@ -185,10 +193,12 @@ export class AppController {
   }
 
   @Post('start-simple')
-  startSimpleStream(@Body() body: { youtubeKey: string, options: StreamOptions }) {
+  startSimpleStream(
+    @Body() body: { youtubeKey: string; options: StreamOptions },
+  ) {
     // return this.appService.startSimpleStream(body.youtubeKey);
-    console.log({body})
-    return this.appService.startRtmpToHlsS3( body.options);
+    console.log({ body });
+    return this.appService.startRtmpToHlsS3(body.options);
   }
 
   @Post('create-rtmp')
@@ -203,6 +213,4 @@ export class AppController {
   ) {
     return this.appService.startStream(streamId, body.youtubeKey);
   }
-
-  
 }

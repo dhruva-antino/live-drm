@@ -9,7 +9,6 @@ import { ServeStaticModule } from '@nestjs/serve-static';
 import { join } from 'path';
 import { HttpModule } from '@nestjs/axios';
 import { StreamService } from './hls.service';
-
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -26,6 +25,7 @@ import { StreamService } from './hls.service';
   ],
   controllers: [AppController],
   providers: [AppService, StreamService],
+
   //  providers: [
   //   {
   //     provide: APP_GUARD,

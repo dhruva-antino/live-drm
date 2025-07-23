@@ -92,18 +92,16 @@ export class StreamService implements OnModuleDestroy {
     if (!stream) throw new Error('Stream not found');
 
     stream.timings.ffmpegStart = Date.now();
-    const maxTimeout = '2147483647';
 
     const ffmpegArgs = [
       '-hide_banner',
       '-loglevel',
       'error',
-      // Use correct live input options
-      '-re', // Read input at native frame rate
+      '-re', 
       '-f',
       'hls',
       '-live_start_index',
-      '0', // Start at first available segment
+      '0',
       '-i',
       stream.inputUrl,
     ];
@@ -183,12 +181,10 @@ export class StreamService implements OnModuleDestroy {
       );
     }
 
-    // Start FFmpeg process
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     stream.process = ffmpeg;
     stream.status = 'listening';
 
-    // Handle FFmpeg output
     ffmpeg.stderr.on('data', (data) => {
       const msg = data.toString();
       if (msg.includes('Input #0')) {
@@ -210,7 +206,6 @@ export class StreamService implements OnModuleDestroy {
       );
     });
 
-    // Set up S3 upload watcher
     const watcher = chokidar.watch(stream.outputDir, {
       persistent: true,
       ignoreInitial: true,
@@ -227,7 +222,152 @@ export class StreamService implements OnModuleDestroy {
       this.uploadToS3(filePath, stream, streamId),
     );
 
-    // Generate playback URL
+    const bucket = this.configService.get('AWS_S3_BUCKET');
+    const region = this.configService.get('AWS_REGION');
+    const s3Prefix = `live-streams/${streamId}`;
+    stream.playbackUrl = `https://${bucket}.s3.${region}.amazonaws.com/${s3Prefix}/master.m3u8`;
+
+    return {
+      message: 'HLS stream processing started',
+      playbackUrl: stream.playbackUrl,
+    };
+  }
+
+  async startHLSStreamV1(streamId: string, options?: StreamOptions) {
+    const stream = this.activeStreams.get(streamId);
+    if (!stream) throw new Error('Stream not found');
+
+    stream.timings.ffmpegStart = Date.now();
+
+    const ffmpegArgs = [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-re', 
+      '-f', 'dash',
+      '-i', stream.inputUrl,
+      '-ignore_io_errors', '1',
+      '-fflags', '+genpts'
+    ];
+
+    if (options?.resolutions && options.resolutions.length > 0) {
+      const filterParts = [];
+      const varStreamMap = [];
+      const mapArgs: string[] = [];
+      const videoBitrates: string[] = [];
+
+      options.resolutions.forEach((res, index) => {
+        const label = `v${index}`;
+        filterParts.push(
+          `[0:v]scale=w=${res.width}:h=${res.height}:force_original_aspect_ratio=decrease[${label}]`,
+        );
+        mapArgs.push('-map', `[${label}]`, '-map', 'a:0?');
+        varStreamMap.push(`v:${index},a:${index},name:stream_${res.height}p`);
+        videoBitrates.push(
+          `-b:v:${index}`,
+          res.bitrate || this.defaultBitrate(res.height),
+        );
+      });
+
+      ffmpegArgs.push(
+        '-filter_complex',
+        filterParts.join(';'),
+        ...mapArgs,
+        '-c:v',
+        'libx264',
+        ...videoBitrates,
+        '-preset',
+        'veryfast',
+        '-c:a',
+        'aac',
+      );
+
+      options.resolutions.forEach((_, i) => {
+        ffmpegArgs.push(`-b:a:${i}`, '128k');
+      });
+
+      ffmpegArgs.push(
+        '-f',
+        'hls',
+        '-hls_time',
+        '4',
+        '-hls_list_size',
+        '0',
+        '-hls_flags',
+        'independent_segments+append_list',
+        '-master_pl_name',
+        'master.m3u8',
+        '-var_stream_map',
+        varStreamMap.join(' '),
+        '-hls_segment_filename',
+        path.join(stream.outputDir, 'stream_%v', 'segment_%03d.ts'),
+        path.join(stream.outputDir, 'stream_%v', 'stream.m3u8'),
+      );
+    } else {
+      ffmpegArgs.push(
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-f',
+        'hls',
+        '-hls_time',
+        '4',
+        '-hls_list_size',
+        '0',
+        '-hls_flags',
+        'independent_segments+append_list',
+        '-hls_segment_filename',
+        path.join(stream.outputDir, 'segment_%03d.ts'),
+        path.join(stream.outputDir, 'master.m3u8'),
+      );
+    }
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    stream.process = ffmpeg;
+    stream.status = 'listening';
+
+    ffmpeg.stderr.on('data', (data) => {
+      const msg = data.toString();
+      if (msg.includes('Input #0')) {
+        stream.status = 'active';
+        stream.timings.ffmpegActive = Date.now();
+        console.log(
+          `[${streamId}] FFmpeg active in: ${stream.timings.ffmpegActive - stream.timings.ffmpegStart}ms`,
+        );
+      }
+      console.log(`[${streamId}] ffmpeg:`, msg.trim());
+    });
+
+    ffmpeg.on('close', async (code) => {
+      console.log(`[${streamId}] ffmpeg exited with ${code}`);
+      stream.status = 'ended';
+      stream.timings.ffmpegExit = Date.now();
+      console.log(
+        `[${streamId}] FFmpeg runtime: ${stream.timings.ffmpegExit - stream.timings.ffmpegStart}ms`,
+      );
+    });
+
+    const watcher = chokidar.watch(stream.outputDir, {
+      persistent: true,
+      ignoreInitial: true,
+      awaitWriteFinish: {
+        stabilityThreshold: 300,
+        pollInterval: 100,
+      },
+    });
+
+    watcher.on('add', (filePath) =>
+    {
+      console.log({filePath})
+      this.uploadToS3(filePath, stream, streamId)
+    }
+    );
+    watcher.on('change', (filePath) =>
+      this.uploadToS3(filePath, stream, streamId),
+    );
+
     const bucket = this.configService.get('AWS_S3_BUCKET');
     const region = this.configService.get('AWS_REGION');
     const s3Prefix = `live-streams/${streamId}`;
@@ -240,7 +380,6 @@ export class StreamService implements OnModuleDestroy {
   }
 
    async convertAndUploadHlsToDash(hlsUrl: string, streamId: string): Promise<string> {
-    // Validate streamId
     if (!streamId) {
       throw new Error('streamId is required');
     }
@@ -366,13 +505,6 @@ export class StreamService implements OnModuleDestroy {
   }
 
   private async uploadToS3(filePath: string, stream: Stream, streamId: string) {
-    if (
-      !filePath.endsWith('.mpd') &&
-      !filePath.endsWith('.m4s') &&
-      !filePath.endsWith('.mp4')
-    ) {
-      return;
-    }
 
     try {
       let contentType: string;
