@@ -45,11 +45,28 @@ export class StreamServiceV1 implements OnModuleDestroy {
       'webm',
       '-i',
       'pipe:0',
-       '-analyzeduration',
-      '2M',
+      '-analyzeduration',
+      '5M',
       '-probesize',
-      '2M',
+      '5M',
+      '-max_delay',
+      '0',
+      '-threads',
+      '0',
     ];
+
+    ffmpegArgs.push(
+      '-flags',
+      '+low_delay',
+      '-fflags',
+      '+nobuffer+flush_packets',
+      '-fflags',
+      '+genpts',
+      '-use_wallclock_as_timestamps',
+      '1',
+      '-tune',
+      'zerolatency',
+    );
 
     if (resolutions.length > 0) {
       const filterParts: string[] = [];
@@ -83,11 +100,13 @@ export class StreamServiceV1 implements OnModuleDestroy {
         '-f',
         'hls',
         '-hls_time',
-        '4',
+        '2',
         '-hls_list_size',
         '0',
         '-hls_flags',
         'independent_segments+append_list',
+        '-force_key_frames',
+        'expr:gte(t,n_forced*2)',
         '-master_pl_name',
         'master.m3u8',
         '-var_stream_map',
@@ -107,9 +126,11 @@ export class StreamServiceV1 implements OnModuleDestroy {
         '-f',
         'hls',
         '-hls_time',
-        '4',
+        '2',
         '-hls_list_size',
         '0',
+        '-force_key_frames',
+        'expr:gte(t,n_forced*2)',
         '-hls_flags',
         'independent_segments+append_list',
         '-hls_segment_filename',
@@ -130,7 +151,6 @@ export class StreamServiceV1 implements OnModuleDestroy {
       inputPipe: ffmpeg.stdin,
     });
 
-    // Upload logic
     const watcher = chokidar.watch(outputDir, {
       persistent: true,
       ignoreInitial: true,

@@ -8,6 +8,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import * as mime from 'mime-types';
 import * as portfinder from 'portfinder';
@@ -106,6 +107,7 @@ export interface StreamOptions {
   signingIvAsHex?: string;
   signer?: string;
   keyServerUrl?: string;
+  dvrWindowSeconds?: number;
 }
 
 enum EncryptionSchemes {
@@ -174,6 +176,14 @@ export interface ActiveStream {
   };
   packagerStarted?: boolean; // New property
   packagerProcess?: ChildProcess; // New property
+  vodUrl?: string;
+  vodDir?: string;
+  livePlaybackUrl?: string;
+  vodPlaybackUrl?: string;
+  uploadQueue?: Set<string>;
+  watcher?: chokidar.FSWatcher;
+  options?: StreamOptions;
+  HLS_SEGMENT_DURATION?: number;
 }
 
 // interface Stream {
@@ -190,6 +200,11 @@ interface Resolution {
   height: number;
   bitrate?: string;
 }
+
+type DVROptions = {
+  dvrWindowSeconds?: number;
+};
+
 @Injectable()
 export class AppService {
   private ffmpegProcess: any;
@@ -223,9 +238,15 @@ export class AppService {
     if (!fs.existsSync(this.hlsBasePath)) {
       fs.mkdirSync(this.hlsBasePath, { recursive: true });
     }
-    this.PACKAGER_PATH = this.getPackagerPath();
     console.log(`Using packager at: ${this.PACKAGER_PATH}`);
   }
+  private vodManifests: Map<
+    string,
+    {
+      playlist: string[];
+      segmentDurations: Map<string, number>;
+    }
+  > = new Map();
 
   createStreamSRT(port: number, streamKey: string): any {
     const streamId = `stream-${Date.now()}-${port}`;
@@ -253,8 +274,258 @@ export class AppService {
     };
   }
 
+  async createVODManifest(
+    streamOutputDir: string,
+    resolutions?: { height: number }[],
+  ) {
+    const masterPath = path.join(streamOutputDir, 'master_vod.m3u8');
+
+    if (resolutions && resolutions.length > 0) {
+      const masterLines: string[] = ['#EXTM3U', '#EXT-X-VERSION:3'];
+
+      resolutions.forEach((res) => {
+        const playlistFile = `stream_stream_${res.height}p_vod.m3u8`;
+        const playlistPath = path.join(
+          streamOutputDir,
+          `stream_stream_${res.height}p`,
+          playlistFile,
+        );
+        const segmentsDir = path.join(
+          streamOutputDir,
+          `stream_stream_${res.height}p`,
+        );
+
+        const tsFiles = fs
+          .readdirSync(segmentsDir)
+          .filter((f) => f.endsWith('.ts'))
+          .sort();
+        const targetDuration = 2;
+
+        const lines: string[] = [
+          '#EXTM3U',
+          '#EXT-X-VERSION:3',
+          '#EXT-X-PLAYLIST-TYPE:VOD',
+          `#EXT-X-TARGETDURATION:${targetDuration}`,
+          '#EXT-X-MEDIA-SEQUENCE:0',
+        ];
+
+        tsFiles.forEach(() => {
+          lines.push(`#EXTINF:${targetDuration.toFixed(3)},`);
+          lines.push(tsFiles.shift()!);
+        });
+
+        lines.push('#EXT-X-ENDLIST');
+        fs.writeFileSync(playlistPath, lines.join('\n'));
+
+        masterLines.push(
+          `#EXT-X-STREAM-INF:BANDWIDTH=${res.height * 1000},RESOLUTION=1280x${res.height}`,
+        );
+        masterLines.push(`stream_stream_${res.height}p/${playlistFile}`);
+      });
+
+      fs.writeFileSync(masterPath, masterLines.join('\n'));
+    } else {
+      const tsFiles = fs
+        .readdirSync(streamOutputDir)
+        .filter((f) => f.endsWith('.ts'))
+        .sort();
+      const targetDuration = 2;
+
+      const lines: string[] = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        '#EXT-X-PLAYLIST-TYPE:VOD',
+        `#EXT-X-TARGETDURATION:${targetDuration}`,
+        '#EXT-X-MEDIA-SEQUENCE:0',
+      ];
+
+      tsFiles.forEach(() => {
+        lines.push(`#EXTINF:${targetDuration.toFixed(3)},`);
+        lines.push(tsFiles.shift()!);
+      });
+
+      lines.push('#EXT-X-ENDLIST');
+      fs.writeFileSync(
+        path.join(streamOutputDir, 'vod.m3u8'),
+        lines.join('\n'),
+      );
+    }
+  }
+
+  async uploadDirectoryToS3(localDir: string, bucket: string, prefix: string) {
+    const files = this.getAllFiles(localDir);
+
+    for (const filePath of files) {
+      const contentType = mime.lookup(filePath) || 'application/octet-stream';
+      const key = path
+        .join(prefix, path.relative(localDir, filePath))
+        .replace(/\\/g, '/');
+
+      const fileStream = fs.createReadStream(filePath);
+      await this.s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: fileStream,
+          ContentType: contentType,
+        }),
+      );
+
+      console.log(`[S3] Uploaded ${key}`);
+    }
+  }
+
+  async uploadFileToS3(filePath: string, bucket: string, key: string) {
+    const contentType = mime.lookup(filePath) || 'application/octet-stream';
+    const fileStream = fs.createReadStream(filePath);
+
+    await this.s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key.replace(/\\/g, '/'),
+        Body: fileStream,
+        ContentType: contentType,
+      }),
+    );
+
+    console.log(`[S3] Uploaded ${key}`);
+  }
+
+  async createAndUploadFullVOD(
+    streamOutputDir: string,
+    bucket: string,
+    prefix: string,
+    resolutions?: { height: number }[],
+    segmentDuration = 2,
+  ) {
+    if (resolutions && resolutions.length > 0) {
+      const masterLines: string[] = ['#EXTM3U', '#EXT-X-VERSION:3'];
+
+      for (const res of resolutions) {
+        const variantDir = path.join(
+          streamOutputDir,
+          `stream_stream_${res.height}p`,
+        );
+
+        const tsFiles = fs
+          .readdirSync(variantDir)
+          .filter((f) => f.endsWith('.ts'))
+          .sort((a, b) => a.localeCompare(b));
+
+        if (tsFiles.length === 0) {
+          console.warn(`[VOD] No TS files for resolution ${res.height}p`);
+          continue;
+        }
+
+        const playlistLines: string[] = [
+          '#EXTM3U',
+          '#EXT-X-VERSION:3',
+          '#EXT-X-PLAYLIST-TYPE:VOD',
+          `#EXT-X-TARGETDURATION:${segmentDuration}`,
+          '#EXT-X-MEDIA-SEQUENCE:0',
+        ];
+
+        for (const tsFile of tsFiles) {
+          playlistLines.push(`#EXTINF:${segmentDuration.toFixed(3)},`);
+          playlistLines.push(tsFile);
+        }
+        playlistLines.push('#EXT-X-ENDLIST');
+
+        const playlistName = `stream_stream_${res.height}p_vod.m3u8`;
+        const playlistPath = path.join(variantDir, playlistName);
+
+        fs.writeFileSync(playlistPath, playlistLines.join('\n'), 'utf8');
+        console.log(
+          `[VOD] Created ${playlistName} (${tsFiles.length} segments)`,
+        );
+
+        for (const tsFile of tsFiles) {
+          const localPath = path.join(variantDir, tsFile);
+          await this.uploadFileToS3(
+            localPath,
+            bucket,
+            path.join(prefix, `stream_stream_${res.height}p`, tsFile),
+          );
+        }
+
+        await this.uploadFileToS3(
+          playlistPath,
+          bucket,
+          path.join(prefix, `stream_stream_${res.height}p`, playlistName),
+        );
+
+        masterLines.push(
+          `#EXT-X-STREAM-INF:BANDWIDTH=${res.height * 1000},RESOLUTION=1280x${res.height}`,
+        );
+        masterLines.push(`stream_stream_${res.height}p/${playlistName}`);
+      }
+
+      const masterPath = path.join(streamOutputDir, 'master_vod.m3u8');
+      fs.writeFileSync(masterPath, masterLines.join('\n'), 'utf8');
+      await this.uploadFileToS3(
+        masterPath,
+        bucket,
+        path.join(prefix, 'master_vod.m3u8'),
+      );
+    } else {
+      const tsFiles = fs
+        .readdirSync(streamOutputDir)
+        .filter((f) => f.endsWith('.ts'))
+        .sort((a, b) => a.localeCompare(b));
+
+      if (tsFiles.length === 0) {
+        console.warn(`[VOD] No TS files for single resolution`);
+        return;
+      }
+
+      const playlistLines: string[] = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:3',
+        '#EXT-X-PLAYLIST-TYPE:VOD',
+        `#EXT-X-TARGETDURATION:${segmentDuration}`,
+        '#EXT-X-MEDIA-SEQUENCE:0',
+      ];
+
+      for (const tsFile of tsFiles) {
+        playlistLines.push(`#EXTINF:${segmentDuration.toFixed(3)},`);
+        playlistLines.push(tsFile);
+      }
+      playlistLines.push('#EXT-X-ENDLIST');
+
+      const playlistName = 'vod.m3u8';
+      const playlistPath = path.join(streamOutputDir, playlistName);
+      fs.writeFileSync(playlistPath, playlistLines.join('\n'), 'utf8');
+      console.log(`[VOD] Created ${playlistName} (${tsFiles.length} segments)`);
+
+      for (const tsFile of tsFiles) {
+        const localPath = path.join(streamOutputDir, tsFile);
+        await this.uploadFileToS3(localPath, bucket, path.join(prefix, tsFile));
+      }
+
+      await this.uploadFileToS3(
+        playlistPath,
+        bucket,
+        path.join(prefix, playlistName),
+      );
+    }
+  }
+
+  getAllFiles(dir: string, fileList: string[] = []): string[] {
+    const files = fs.readdirSync(dir);
+    files.forEach((file) => {
+      const filePath = path.join(dir, file);
+      if (fs.statSync(filePath).isDirectory()) {
+        this.getAllFiles(filePath, fileList);
+      } else {
+        fileList.push(filePath);
+      }
+    });
+    return fileList;
+  }
+
   async startListenerSRT(streamId: string, options?: StreamOptions) {
     const stream = this.activeStreams.get(streamId);
+    console.log({ stream });
     // if (!stream || stream.status !== 'created')
     //   return 'Stream not found or already started';
     stream.timings = {
@@ -264,15 +535,22 @@ export class AppService {
       firstFileUploadEnd: 0,
       ffmpegExit: 0,
     };
+
     let firstFileUploaded = false;
     const masterPlaylistPath = path.join(stream.outputDir, 'master.m3u8');
 
-    // const srtUrl = `srt://563fg0wz-3333.inc1.devtunnels.ms:9000`;
-    // const srtUrl = `srt://06d7721f4128.ngrok-free.app:9000?mode=listener&whitelist=0.0.0.0/0`;
-    // const srtUrl = `srt://0.0.0.0:8000?mode=listener`;
-    const srtUrl = `srt://domeproductions-vngdkppdwm.dynamic-m.com:11383`;
-
+    const srtUrl = `srt://0.0.0.0:7878?mode=listener`;
+    // const srtUrl = `srt://domeproductions-vngdkppdwm.dynamic-m.com:11383`;
+    const HLS_SEGMENT_DURATION = 4; // seconds
+    const DVR_WINDOW_MINUTES = 120;
+    const hlsListSize = DVR_WINDOW_MINUTES / HLS_SEGMENT_DURATION;
     const outputPath = path.join(stream.outputDir, 'master.m3u8');
+    console.log({
+      HLS_SEGMENT_DURATION,
+      DVR_WINDOW_MINUTES,
+      hlsListSize,
+      stream,
+    });
     console.time('Time starts for ffmpeg ------>');
     const ffmpegArgs = [
       '-hide_banner',
@@ -283,9 +561,9 @@ export class AppService {
       '-fflags',
       '+genpts',
       '-analyzeduration',
-      '2M',
+      '5M',
       '-probesize',
-      '2M',
+      '5M',
       '-i',
       srtUrl,
     ];
@@ -298,8 +576,9 @@ export class AppService {
       options.resolutions.forEach((res, index) => {
         const label = `v${index}`;
         filterParts.push(
-          `[0:v]scale=w=${res.width}:h=${res.height}:force_original_aspect_ratio=decrease[${label}]`,
+          `[0:v]scale=w=${res.width}:h=${res.height}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2[${label}]`,
         );
+
         mapArgs.push('-map', `[${label}]`, '-map', 'a:0?');
         varStreamMap.push(`v:${index},a:${index},name:stream_${res.height}p`);
         videoBitrates.push(
@@ -320,9 +599,9 @@ export class AppService {
         '-c:a',
         'aac',
         '-force_key_frames',
-        'expr:gte(t,n_forced*2)', // Keyframe every 4 seconds
+        'expr:gte(t,n_forced*5)',
         '-g',
-        '48', // GOP size: 12 * segment duration (4s) * FPS (assume 12 fps) or adjust accordingly
+        '48',
         '-keyint_min',
         '48',
         '-sc_threshold',
@@ -334,18 +613,16 @@ export class AppService {
       });
 
       ffmpegArgs.push(
-        '-force_key_frames',
-        'expr:gte(t,n_forced*2)', // Force keyframes every 4 seconds
-        '-sc_threshold',
-        '0',
         '-f',
         'hls',
         '-hls_time',
-        '4',
+        HLS_SEGMENT_DURATION.toString(),
+        '-hls_delete_threshold',
+        '1',
         '-hls_list_size',
-        '0',
+        hlsListSize.toString(),
         '-hls_flags',
-        'independent_segments+append_list',
+        'program_date_time+independent_segments',
         '-master_pl_name',
         'master.m3u8',
         '-var_stream_map',
@@ -356,10 +633,6 @@ export class AppService {
       );
     } else {
       ffmpegArgs.push(
-        '-force_key_frames',
-        'expr:gte(t,n_forced*4)', // Force keyframes every 4 seconds
-        '-sc_threshold',
-        '0',
         '-c:v',
         'copy',
         '-c:a',
@@ -369,19 +642,19 @@ export class AppService {
         '-f',
         'hls',
         '-hls_time',
-        '4',
+        HLS_SEGMENT_DURATION.toString(),
+          '-hls_delete_threshold',
+          '1',
         '-hls_list_size',
-        '0',
-        '-force_key_frames',
-        'expr:gte(t,n_forced*4)', // Keyframe every 4 seconds
+        hlsListSize.toString(),
         '-g',
-        '48', // GOP size: 12 * segment duration (4s) * FPS (assume 12 fps) or adjust accordingly
+        '48',
+        '-hls_start_number_source',
+        'epoch',
         '-keyint_min',
         '48',
-        '-sc_threshold',
-        '0',
         '-hls_flags',
-        'independent_segments+append_list',
+        'delete_segments+program_date_time+independent_segments',
         '-hls_segment_filename',
         path.join(stream.outputDir, 'segment_%03d.ts'),
         outputPath,
@@ -411,6 +684,22 @@ export class AppService {
       console.log(`[${streamId}] ffmpeg exited with ${code}`);
       stream.status = 'ended';
       stream.timings.ffmpegExit = Date.now();
+      await this.createAndUploadFullVOD(
+        stream.outputDir,
+        bucket!,
+        `live-streams/${streamId}`,
+        options?.resolutions, // pass resolutions array if multi-res
+        2, // your HLS_SEGMENT_DURATION
+      );
+      // Step 1: Generate VOD playlist(s)
+      // await this.createVODManifest(stream.outputDir, options?.resolutions);
+
+      // Step 2: Upload the folder
+      // await this.uploadDirectoryToS3(stream.outputDir, bucket, s3Prefix);
+
+      console.log(
+        `[${streamId}] VOD ready at: https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Prefix}/master_vod.m3u8`,
+      );
       console.log(
         `[${streamId}] FFmpeg runtime: ${stream.timings.ffmpegExit - stream.timings.ffmpegStart}ms`,
       );
@@ -443,7 +732,7 @@ export class AppService {
             Key: key,
             Body: fileStream,
             ContentType: contentType,
-            ACL: 'public-read',
+            // ACL: 'public-read',
           }),
         );
         if (!stream.timings.firstFileUploadEnd) {
@@ -463,8 +752,8 @@ export class AppService {
       persistent: true,
       ignoreInitial: true,
       awaitWriteFinish: {
-        stabilityThreshold: 300,
-        pollInterval: 100,
+        stabilityThreshold: 2000,
+        pollInterval: 259,
       },
     });
     console.time('Time starts for S3 ------>');
@@ -479,343 +768,6 @@ export class AppService {
       message: `Live stream started`,
       s3PlaybackUrl: stream.playbackUrl,
     };
-  }
-
-  private getPackagerPath(): string {
-    const possiblePaths = [
-      '/usr/local/bin/packager', // Homebrew default (Intel)
-      '/opt/homebrew/bin/packager', // Homebrew default (Apple Silicon)
-      path.resolve(__dirname, '../scripts/packager-osx-x64'), // Custom location
-    ];
-
-    for (const p of possiblePaths) {
-      if (fs.existsSync(p)) {
-        try {
-          fs.chmodSync(p, 0o755); // Ensure executable
-          return p;
-        } catch (e) {
-          console.warn(`Could not set permissions for ${p}:`, e);
-        }
-      }
-    }
-
-    return 'packager'; // Fallback to PATH
-  }
-
-  async startListenerSRTWithDRM(streamId: string, options?: StreamOptions) {
-    const stream = this.activeStreams.get(streamId);
-    if (!stream || stream.status !== 'created') {
-      return 'Stream not found or already started';
-    }
-
-    // Create output directory
-    if (!fs.existsSync(stream.outputDir)) {
-      fs.mkdirSync(stream.outputDir, { recursive: true });
-    }
-
-    // Setup timings
-    // stream.timings = { ffmpegStart: Date.now() };
-
-    const srtUrl = `srt://0.0.0.0:${stream.port}?mode=listener&streamid=#!::r=${stream.streamKey}`;
-    console.log(`Starting SRT listener at ${srtUrl}`);
-
-    // Prepare resolutions
-    const resolutions = options?.resolutions || [
-      { width: 1280, height: 720, bitrate: '2500k' },
-      { width: 854, height: 480, bitrate: '1200k' },
-      { width: 640, height: 360, bitrate: '700k' },
-    ];
-
-    // Fixed FFmpeg command for HLS with TS segments
-    const ffmpegArgs = [
-      '-hide_banner',
-      '-loglevel',
-      'verbose', // More detailed logging
-      '-fflags',
-      '+genpts',
-      '-analyzeduration',
-      '100M',
-      '-probesize',
-      '100M',
-      '-i',
-      srtUrl,
-    ];
-
-    // Build filter complex
-    const filterComplex = [];
-    const mapArgs = [];
-
-    // 1. Split video into multiple streams
-    filterComplex.push(
-      `[0:v]split=${resolutions.length}${resolutions.map((_, i) => `[v${i}in]`).join('')}`,
-    );
-
-    // 2. Scale each stream
-    resolutions.forEach((res, i) => {
-      filterComplex.push(
-        `[v${i}in]scale=w=${res.width}:h=${res.height}:force_original_aspect_ratio=decrease[v${i}out]`,
-      );
-      mapArgs.push('-map', `[v${i}out]`);
-    });
-
-    ffmpegArgs.push('-filter_complex', filterComplex.join(';'));
-
-    // Add video encoding params
-    resolutions.forEach((res, i) => {
-      ffmpegArgs.push(
-        `-c:v:${i}`,
-        'libx264',
-        `-b:v:${i}`,
-        res.bitrate,
-        `-preset`,
-        'veryfast',
-        `-g`,
-        '48',
-        `-keyint_min`,
-        '48',
-        `-sc_threshold`,
-        '0',
-      );
-    });
-
-    // Audio handling (make it optional)
-    ffmpegArgs.push(
-      '-map',
-      '0:a?', // Optional audio
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
-    );
-
-    // HLS output parameters
-    ffmpegArgs.push(
-      '-f',
-      'hls',
-      '-hls_time',
-      '4',
-      '-hls_list_size',
-      '10',
-      '-hls_flags',
-      'independent_segments+delete_segments',
-      '-var_stream_map',
-      resolutions
-        .map(
-          (_, i) =>
-            `v:${i}${resolutions.length > 1 ? `,a:${i}` : ''},name:${resolutions[i].height}p`,
-        )
-        .join(' '),
-      '-master_pl_name',
-      'master_unencrypted.m3u8',
-      path.join(stream.outputDir, 'stream_%v.m3u8'),
-    );
-
-    console.log('FFmpeg command:', 'ffmpeg ' + ffmpegArgs.join(' '));
-    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-    stream.process = ffmpeg;
-    stream.status = 'listening';
-
-    // FFmpeg logging
-    ffmpeg.stderr.on('data', (data) => {
-      const msg = data.toString();
-      console.log(`[${streamId}] ffmpeg:`, msg.trim());
-
-      // Detect stream start
-      // if (msg.includes('Input #0') && !stream.timings.ffmpegActive) {
-      //   stream.timings.ffmpegActive = Date.now();
-      //   console.log(
-      //     `FFmpeg active in: ${stream.timings.ffmpegActive - stream.timings.ffmpegStart}ms`,
-      //   );
-      // }
-
-      // Detect master playlist creation
-      if (msg.includes('master_unencrypted.m3u8') && !stream.packagerStarted) {
-        stream.packagerStarted = true;
-        setTimeout(() => {
-          this.startPackager(stream, streamId, resolutions.length);
-        }, 3000);
-      }
-    });
-
-    ffmpeg.on('error', (err) => {
-      console.error(`[${streamId}] FFmpeg error:`, err);
-    });
-
-    ffmpeg.on('close', (code) => {
-      console.log(`[${streamId}] FFmpeg exited with code ${code}`);
-      if (stream.packagerProcess) stream.packagerProcess.kill();
-    });
-
-    // File watcher setup
-    const bucket = process.env.AWS_S3_BUCKET!;
-    const s3Prefix = `live-streams/${streamId}`;
-
-    const uploadToS3 = async (filePath: string) => {
-      if (!filePath.endsWith('.m3u8') && !filePath.endsWith('.ts')) return;
-
-      try {
-        const key = path
-          .join(s3Prefix, path.relative(stream.outputDir, filePath))
-          .replace(/\\/g, '/');
-        const contentType = filePath.endsWith('.m3u8')
-          ? 'application/x-mpegURL'
-          : 'video/MP2T';
-
-        await this.s3.send(
-          new PutObjectCommand({
-            Bucket: bucket,
-            Key: key,
-            Body: fs.createReadStream(filePath),
-            ContentType: contentType,
-            ACL: 'public-read',
-          }),
-        );
-      } catch (err) {
-        console.error(`Upload failed: ${filePath}`, err);
-      }
-    };
-
-    const watcher = chokidar.watch(stream.outputDir, {
-      persistent: true,
-      ignoreInitial: false,
-      depth: 99,
-      awaitWriteFinish: {
-        stabilityThreshold: 1000,
-        pollInterval: 100,
-      },
-    });
-
-    watcher.on('add', uploadToS3);
-    watcher.on('change', uploadToS3);
-
-    stream.playbackUrl = `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Prefix}/master.m3u8`;
-    return {
-      message: `Live stream started with DRM protection`,
-      playbackUrl: stream.playbackUrl,
-    };
-  }
-
-  async startPackager(stream: any, streamId: string, variantCount: number) {
-    console.log('Starting Shaka Packager for encryption...');
-
-    const KEY_SERVER_URL = process.env.WIDEVINE_KEY_SERVER_URL!;
-    const WIDEVINE_PROVIDER = process.env.WIDEVINE_PROVIDER!;
-    const WIDEVINE_SIGNING_KEY = process.env.WIDEVINE_SIGNING_KEY!;
-    const WIDEVINE_SIGNING_IV = process.env.WIDEVINE_SIGNING_IV!;
-
-    const packagerArgs = [
-      '--enable_widevine_encryption',
-      `--key_server_url="${KEY_SERVER_URL}"`,
-      `--content_id="${streamId}"`,
-      `--signer="${WIDEVINE_PROVIDER}"`,
-      `--aes_signing_key="${WIDEVINE_SIGNING_KEY}"`,
-      `--aes_signing_iv="${WIDEVINE_SIGNING_IV}"`,
-      '--protection_scheme=cbcs',
-      '--hls_key_uri="skd://' + streamId + '"',
-      `--hls_master_playlist_output="${path.join(stream.outputDir, 'master.m3u8')}"`,
-      '--hls_playlist_type',
-      'LIVE',
-      '--hls_base_url',
-      `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/live-streams/${streamId}/`,
-      '--segment_duration',
-      '4',
-      '--fragment_duration',
-      '4',
-      '--time_shift_buffer_depth',
-      '30',
-      '--preserved_segments_outside_live_window',
-      '10',
-      '--default_language=eng',
-      '-v',
-      '2', // Verbose logging
-    ];
-
-    // Add each variant
-    for (let i = 0; i < variantCount; i++) {
-      const playlistPath = path.join(stream.outputDir, `stream_${i}.m3u8`);
-      packagerArgs.push(
-        `in=${playlistPath},format=hls,playlist_name=enc_stream_${i}.m3u8,iframe_playlist_name=enc_iframe_${i}.m3u8`,
-      );
-    }
-
-    console.log('Packager command:', 'packager ' + packagerArgs.join(' '));
-
-    try {
-      const packager = spawn('packager', packagerArgs, {
-        shell: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      stream.packagerProcess = packager;
-
-      packager.stdout.on('data', (data) => {
-        console.log(`[Packager] ${data.toString().trim()}`);
-      });
-
-      packager.stderr.on('data', (data) => {
-        console.error(`[Packager ERROR] ${data.toString().trim()}`);
-      });
-
-      packager.on('close', (code) => {
-        console.log(`Packager exited with code ${code}`);
-      });
-    } catch (err) {
-      console.error('Failed to start packager:', err);
-    }
-  }
-
-  private setupS3Uploader(streamId: string, outputDir: string) {
-    const bucket = process.env.AWS_S3_BUCKET;
-    const region = process.env.AWS_REGION;
-    const s3Prefix = `live-streams/${streamId}`;
-
-    const watcher = chokidar.watch(outputDir, {
-      persistent: true,
-      ignoreInitial: true,
-      awaitWriteFinish: {
-        stabilityThreshold: 300,
-        pollInterval: 100,
-      },
-    });
-
-    const uploadFileToS3 = async (filePath: string) => {
-      try {
-        const fileStream = fs.createReadStream(filePath);
-        const contentType = mime.lookup(filePath) || 'application/octet-stream';
-        const key = path
-          .join(s3Prefix, path.relative(outputDir, filePath))
-          .replace(/\\/g, '/');
-
-        await this.s3.send(
-          new PutObjectCommand({
-            Bucket: bucket,
-            Key: key,
-            Body: fileStream,
-            ContentType: contentType,
-            CacheControl: filePath.endsWith('.m3u8')
-              ? 'no-store'
-              : 'public, max-age=31536000',
-            ACL: 'public-read',
-          }),
-        );
-
-        console.log(`[S3] Uploaded ${key}`);
-      } catch (err) {
-        console.error(`[S3] Upload failed for ${filePath}`, err);
-      }
-    };
-
-    watcher.on('add', async (filePath) => {
-      if (filePath.endsWith('.ts') || filePath.endsWith('.m3u8')) {
-        await uploadFileToS3(filePath);
-      }
-    });
-
-    watcher.on('change', async (filePath) => {
-      if (filePath.endsWith('.m3u8')) {
-        await uploadFileToS3(filePath);
-      }
-    });
   }
 
   async startSimpleStreamOld(youtubeKey: string) {

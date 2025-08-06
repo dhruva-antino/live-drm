@@ -25,15 +25,15 @@ async function bootstrap() {
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
   });
-  app.useStaticAssets(join(__dirname, '..', 'public'));
-  app.useWebSocketAdapter(new WsAdapter(app));
+  // app.useStaticAssets(join(__dirname, '..', 'public'));
+  // app.useWebSocketAdapter(new WsAdapter(app));
   // const httpServer: Server = app.getHttpServer();
   // const wss = new WebSocketServer({ server: httpServer, path: '/signaling' });
 
   // const signalingGateway = app.get(SignalingGateway);
   // (signalingGateway as any).server = wss;
   const configService = app.get(ConfigService);
-  console.log(configService.get('PORT'));
-  // await app.listen(configService.get('PORT') || 3000);
+  // console.log(configService.get('PORT'));
+  await app.listen(configService.get('PORT') || 3000);
 }
 bootstrap();

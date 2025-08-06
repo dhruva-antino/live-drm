@@ -135,47 +135,6 @@ export class AppController {
     return this.appService.startListenerSRT(streamId, body);
   }
 
-  @Post('start-drm')
-  async startListenerSRTWithDRM(
-    @Query('id') streamId: string,
-    @Body()
-    body: StreamOptions,
-  ) {
-    if (!streamId) {
-      throw new BadRequestException('Missing stream ID');
-    }
-
-    // Validate resolutions if present
-    // if (body.resolutions) {
-    //   for (const res of body.resolutions) {
-    //     if (
-    //       typeof res.width !== 'number' ||
-    //       typeof res.height !== 'number' ||
-    //       (res.bitrate && typeof res.bitrate !== 'string')
-    //     ) {
-    //       throw new BadRequestException(
-    //         'Each resolution must have numeric width and height. Bitrate (if present) must be a string.',
-    //       );
-    //     }
-    //   }
-    // }
-    console.log({
-      signingKeyAsHex: process.env.WIDEVINE_SIGNING_KEY,
-      signingIvAsHex: process.env.WIDEVINE_SIGNING_IV,
-      signer: process.env.WIDEVINE_PROVIDER_NAME,
-      keyServerUrl: process.env.KEY_SERVER_URL,
-    });
-    return this.appService.startListenerSRTWithDRM(streamId, {
-      ...body,
-      isDRM: true,
-      resolutions: body.resolutions,
-      signingKeyAsHex: process.env.WIDEVINE_SIGNING_KEY,
-      signingIvAsHex: process.env.WIDEVINE_SIGNING_IV,
-      signer: process.env.WIDEVINE_PROVIDER_NAME,
-      keyServerUrl: process.env.KEY_SERVER_URL,
-    });
-  }
-
   @Post('stop')
   stopListener(@Query('id') id: string): string {
     return this.appService.stopListener(id);

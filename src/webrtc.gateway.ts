@@ -2,37 +2,22 @@ import {
   WebSocketGateway,
   WebSocketServer,
   OnGatewayConnection,
-  OnGatewayDisconnect,
 } from '@nestjs/websockets';
 import { Server, WebSocket } from 'ws';
-import { IncomingMessage } from 'http';
 import * as url from 'url';
 import * as wrtc from '@koush/wrtc';
 import { Logger } from '@nestjs/common';
-// import { StreamServiceV1 } from './webrtc.service';
 import path from 'path';
 import * as fs from 'fs';
-import { spawn } from 'child_process';
-import * as chokidar from 'chokidar';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
-import * as mime from 'mime-types';
 import { StreamServiceV1 } from './webrtc.service';
 
-@WebSocketGateway(3334, { path: '/signaling' })
+@WebSocketGateway(3334)
 export class WebrtcGateway implements OnGatewayConnection {
   @WebSocketServer()
   server: Server;
   private logger = new Logger(WebrtcGateway.name);
   private clients: Map<string, WebSocket> = new Map();
   private peerConnections: Map<string, wrtc.RTCPeerConnection> = new Map();
-  private sessions = new Map<string, { ffmpeg: any; ws: WebSocket }>();
-  private s3 = new S3Client({
-    region: process.env.AWS_REGION,
-    credentials: {
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-    },
-  });
   constructor(private readonly streamService: StreamServiceV1) {}
 
   async handleConnection(client: WebSocket, req: any) {
@@ -46,8 +31,6 @@ export class WebrtcGateway implements OnGatewayConnection {
     console.log(`Client connected: ${streamId}`);
     const outputDir = path.join(process.cwd(), 'streams', streamId);
     fs.mkdirSync(outputDir, { recursive: true });
-    const s3Prefix = `live-streams/${streamId}`;
-    // inside handleConnection
     this.streamService.startFFmpeg(streamId, [
       { width: 640, height: 360, bitrate: '800k' },
       { width: 1280, height: 720, bitrate: '2500k' },
